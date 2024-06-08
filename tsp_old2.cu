@@ -15,6 +15,7 @@
 #include <omp.h>
 
 struct City {
+    int id;
     double x, y;
 };
 
@@ -43,8 +44,7 @@ std::vector<City> readTSPFile(const std::string& filename) {
             if (inNodeSection) {
                 std::istringstream iss(line);
                 City city;
-                int tmp;
-                iss >> tmp >> city.x >> city.y;
+                iss >> city.id >> city.x >> city.y;
                 cities.push_back(city);
             }
         }
@@ -93,40 +93,27 @@ double host_fitness(const std::vector<City>& cities, const std::vector<int>& pat
     return 1.0 / host_pathDistance(cities, path);
 }
 
-__global__ void calculateDistances(const City* cities, double* distanceMatrix, int numCities) {
-    
-    unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    unsigned int stride = blockDim.x * gridDim.x;
-
-    for (unsigned int i = idx; i < numCities * numCities; i += stride) {
-        int x = i / numCities;
-        int y = i % numCities;
-        double dx = cities[x].x - cities[y].x;
-        double dy = cities[x].y - cities[y].y;
-        distanceMatrix[i] = std::sqrt(dx * dx + dy * dy);
-        // printf("(%d,%d) = %f\n", x, y, distanceMatrix[i]);
-    }
+__device__ double distance(const City& a, const City& b) {
+    return sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
 }
 
-__device__ double pathDistance(const City* cities, const double* distanceMatrix, const int* path, int numCities) {
-    
+__device__ double pathDistance(const City* cities, const int* path, int numCities) {
     double totalDistance = 0.0;
+
     for (int i = 0; i < numCities - 1; ++i) {
-        totalDistance += distanceMatrix[path[i] * numCities + path[i + 1]];
+        totalDistance += distance(cities[path[i]], cities[path[i + 1]]);
     }
-    totalDistance += distanceMatrix[path[0] * numCities + path[numCities - 1]];
+    totalDistance += distance(cities[path[numCities - 1]], cities[path[0]]);
     return totalDistance;
 }
 
-__global__ void calculateFitness(const City* cities, double* distanceMatrix, const int* population, double* fitnessValues, int numCities, int populationSize) {
+__global__ void calculateFitness(const City* cities, const int* population, double* fitnessValues, int numCities, int populationSize) {
     unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
     unsigned int stride = blockDim.x * gridDim.x;
-
     for (unsigned int i = idx; i < populationSize; i += stride) {
-        fitnessValues[idx] = 1.0 / pathDistance(cities, distanceMatrix, &population[idx * numCities], numCities);
+        fitnessValues[idx] = 1.0 / pathDistance(cities, &population[idx * numCities], numCities);
     }
 }
-
 
 std::vector<std::vector<int>> initializePopulation(int populationSize, int numCities) {
     std::vector<std::vector<int>> population(populationSize, std::vector<int>(numCities));
@@ -233,7 +220,7 @@ __global__ void setupCurandStates(curandState* states, unsigned long seed, int p
 }
 
 
-__global__ void geneticAlgorithmKernel(const City* cities, int* population, int* next_population, double* distanceMatrix, double* fitnessValues, double* next_fitnessValues, int numCities, int populationSize, int islandSize, curandState* states) {
+__global__ void geneticAlgorithmKernel(const City* cities, int* population,  int* next_population, double* fitnessValues, int numCities, int populationSize, int islandSize, curandState* states) {
     unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
     unsigned int stride = blockDim.x * gridDim.x;
 
@@ -242,20 +229,16 @@ __global__ void geneticAlgorithmKernel(const City* cities, int* population, int*
 
         int parent1Idx = tournamentSelection(fitnessValues, populationSize, i, islandSize, state);
         int parent2Idx = tournamentSelection(fitnessValues, populationSize, i, islandSize, state);
-        long p1 = parent1Idx * numCities;
-        long p2 = parent2Idx * numCities;
 
-        const int* parent1 = &population[p1];
-        const int* parent2 = &population[p2];
-        int* child = &next_population[i * numCities];
+        const int* parent1 = &population[parent1Idx * numCities];
+        const int* parent2 = &population[parent2Idx * numCities];
+        int* child = &next_population[idx * numCities];
 
         orderCrossover(parent1, parent2, child, numCities, state);
 
         if (curand(state) % 100 < 10) {
             mutate(child, numCities, state);
         }
-
-        next_fitnessValues[idx] = 1.0 / pathDistance(cities, distanceMatrix, child, numCities);
     }
 }
 
@@ -288,14 +271,12 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
     City* d_cities1;
     int* d_population1, *d_next_population1;
     double* d_fitnessValues1, *d_next_fitnessValues1;
-    double* d_distanceMatrix1;
     curandState* d_states1;
 
     //define pointers for GPU 1
     City* d_cities2;
     int* d_population2, *d_next_population2;
     double* d_fitnessValues2, *d_next_fitnessValues2;
-    double* d_distanceMatrix2;
     curandState* d_states2;
 
     //variables for counting block and threads
@@ -324,7 +305,7 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
             //initial population1 in CPU
             population1 = initializePopulation(populationSize, numCities);
             flatPopulation1 = flattenPopulation(population1);
- 
+
             //malloc in GPU 0 
             cudaMalloc((void**)&d_cities1, numCities * sizeof(City));
             cudaMalloc((void**)&d_population1, populationSize * numCities * sizeof(int));
@@ -332,7 +313,6 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
             cudaMalloc((void**)&d_fitnessValues1, populationSize * sizeof(double));
             cudaMalloc((void**)&d_next_fitnessValues1, populationSize * sizeof(double));
             cudaMalloc((void**)&d_states1, populationSize * sizeof(curandState));
-            cudaMalloc(&d_distanceMatrix1, numCities * numCities * sizeof(double));
 
             //memory copy dities and population to GPU 0
             cudaMemcpy(d_cities1, cities.data(), numCities * sizeof(City), cudaMemcpyHostToDevice);
@@ -353,9 +333,6 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
 
             //set random state for GPU 0 
             setupCurandStates<<<numBlocks, blockSize>>>(d_states1, time(0), populationSize);
-            // cudaDeviceSynchronize();
-
-            calculateDistances<<<numBlocks, blockSize>>>(d_cities1, d_distanceMatrix1, numCities);
             cudaDeviceSynchronize();
 
         } else {
@@ -374,7 +351,6 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
             cudaMalloc((void**)&d_fitnessValues2, populationSize * sizeof(double));
             cudaMalloc((void**)&d_next_fitnessValues2, populationSize * sizeof(double));
             cudaMalloc((void**)&d_states2, populationSize * sizeof(curandState));
-            cudaMalloc(&d_distanceMatrix2, numCities * numCities * sizeof(double));
 
             //memory copy dities and population to GPU 1
             cudaMemcpy(d_cities2, cities.data(), numCities * sizeof(City), cudaMemcpyHostToDevice);
@@ -389,9 +365,6 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
 
             //set random state for GPU 1 
             setupCurandStates<<<numBlocks, blockSize>>>(d_states2, time(0), populationSize);
-            // cudaDeviceSynchronize();
-
-            calculateDistances<<<numBlocks, blockSize>>>(d_cities2, d_distanceMatrix2, numCities);
             cudaDeviceSynchronize();
         }
 
@@ -420,12 +393,14 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
             if(thread_id == 0){
 
                 showProgress(gen, generations, startTime);
-
                 //GPU 0
-                calculateFitness<<<numBlocks, blockSize>>>(d_cities1, d_distanceMatrix1, d_population1, d_fitnessValues1, numCities, populationSize);
+                calculateFitness<<<numBlocks, blockSize>>>(d_cities1, d_population1, d_fitnessValues1, numCities, populationSize);
                 cudaDeviceSynchronize();
 
-                geneticAlgorithmKernel<<<numBlocks, blockSize>>>(d_cities1, d_population1, d_next_population1, d_distanceMatrix1, d_fitnessValues1, d_next_fitnessValues1, numCities, populationSize, islandSize, d_states1);
+                geneticAlgorithmKernel<<<numBlocks, blockSize>>>(d_cities1, d_population1, d_next_population1, d_fitnessValues1, numCities, populationSize, islandSize, d_states1);
+                cudaDeviceSynchronize();
+
+                calculateFitness<<<numBlocks, blockSize>>>(d_cities1, d_next_population1, d_next_fitnessValues1, numCities, populationSize);
                 cudaDeviceSynchronize();
 
                 applyNextGen<<<numBlocks, blockSize>>>(d_cities1, d_population1, d_next_population1, d_fitnessValues1, d_next_fitnessValues1, numCities, populationSize, d_states1);
@@ -434,10 +409,13 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
             } else {
 
                 //GPU 1
-                calculateFitness<<<numBlocks, blockSize>>>(d_cities2, d_distanceMatrix2, d_population2, d_fitnessValues2, numCities, populationSize);
+                calculateFitness<<<numBlocks, blockSize>>>(d_cities2, d_population2, d_fitnessValues2, numCities, populationSize);
                 cudaDeviceSynchronize();
 
-                geneticAlgorithmKernel<<<numBlocks, blockSize>>>(d_cities2, d_population2, d_next_population2, d_distanceMatrix2, d_fitnessValues2, d_next_fitnessValues2, numCities, populationSize, islandSize, d_states2);
+                geneticAlgorithmKernel<<<numBlocks, blockSize>>>(d_cities2, d_population2, d_next_population2, d_fitnessValues2, numCities, populationSize, islandSize, d_states2);
+                cudaDeviceSynchronize();
+
+                calculateFitness<<<numBlocks, blockSize>>>(d_cities2, d_next_population2, d_next_fitnessValues2, numCities, populationSize);
                 cudaDeviceSynchronize();
 
                 applyNextGen<<<numBlocks, blockSize>>>(d_cities2, d_population2, d_next_population2, d_fitnessValues2, d_next_fitnessValues2, numCities, populationSize, d_states2);
@@ -495,11 +473,8 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
 
             cudaFree(d_cities1);
             cudaFree(d_population1);
-            cudaFree(d_next_population1);
             cudaFree(d_fitnessValues1);
-            cudaFree(d_next_fitnessValues1);
             cudaFree(d_states1);
-            cudaFree(d_distanceMatrix1);
 
             population1 = unflattenPopulation(flatPopulation1.data(), populationSize, numCities);
             int bestIndex = 0;
@@ -518,11 +493,8 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
 
             cudaFree(d_cities2);
             cudaFree(d_population2);
-            cudaFree(d_next_population2);
             cudaFree(d_fitnessValues2);
-            cudaFree(d_next_fitnessValues2);
             cudaFree(d_states2);
-            cudaFree(d_distanceMatrix2);
 
             population2 = unflattenPopulation(flatPopulation2.data(), populationSize, numCities);
             int bestIndex = 0;
@@ -556,34 +528,30 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
 int main() {
 
     // std::vector<City> cities = {
-    //     {60, 200}, {180, 200}, {80, 180}, {140, 180}, {20, 160} 
-    //     // {100, 160}, {200, 160}, {140, 140}, {40, 120}, {100, 120},
-    //     // {180, 100}, {60, 80}, {120, 80}, {180, 60}, {20, 40},
-    //     // {100, 40}, {200, 40}, {20, 20}, {60, 20}, {160, 20}
+    //     {0, 60, 200}, {1, 180, 200}, {2, 80, 180}, {3, 140, 180}, {4, 20, 160}, 
+    //     {5, 100, 160}, {6, 200, 160}, {7, 140, 140}, {8, 40, 120}, {9, 100, 120},
+    //     {10, 180, 100}, {11, 60, 80}, {12, 120, 80}, {13, 180, 60}, {14, 20, 40},
+    //     {15, 100, 40}, {16, 200, 40}, {17, 20, 20}, {18, 60, 20}, {19, 160, 20}
     // };
 
     // std::string filename = "assets/qa194.tsp";
-    // double answer = 9771.0;
-    // std::string filename = "assets/uy734.tsp";
-    // double answer = 86396.0;
-    std::string filename = "assets/mg1000.tsp";
-    double answer = 38185.0;
+    // double answer = 9700.0;
+    std::string filename = "assets/uy734.tsp";
+    double answer = 86000.0;
 
     std::vector<City> cities = readTSPFile(filename);
     std::cout << "\n====================================" << std::endl;
     std::cout << "map file        : " << filename << std::endl;
 
     auto start_time = std::chrono::steady_clock::now();
-    int populationSize = cities.size() * 20;
-    int generations = 4000;
+    int populationSize = cities.size() * 40;
+    int generations = 2;
 
     std::cout << "population size : " << populationSize << std::endl;
     std::cout << "generations     : " << generations << std::endl;
 
     std::vector<int> bestPath = geneticAlgorithm(cities, populationSize, generations);
-
     auto end_time = std::chrono::steady_clock::now();
-
     auto start = find(bestPath.begin(), bestPath.end(), 0);
     if (start != bestPath.end()) {
         size_t index = std::distance(bestPath.begin(), start);
@@ -592,22 +560,12 @@ int main() {
             std::cout << bestPath[(index + i) % bestPath.size()] << " ";
         }
     }
-    std::cout << "0" << std::endl;
+    std::cout <<"0"<< std::endl;
 
     double totalDistance = host_pathDistance(cities, bestPath);
 
     std::cout << "Total distance: " << totalDistance << std::endl;
     std::cout << "error: " << answer / totalDistance * 100 << "%" << std::endl;
-    std::cout<<"Running Times: "<< std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count() << " s\n";
+    std::cout<<"Running Times: "<< std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count() << " s.\n";
     return 0;
 }
-
-/*
-
-approximate best path from SOM-TSP:
-    qa194   : 9700
-    uy734   : 86000
-    fi10639 : 638131
-    it16862 : 
-
-*/
