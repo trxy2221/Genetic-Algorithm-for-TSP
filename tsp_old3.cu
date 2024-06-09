@@ -18,7 +18,6 @@ struct City {
     double x, y;
 };
 
-
 void checkCudaError(cudaError_t err, const char *msg) {
     if (err != cudaSuccess) {
         std::cerr << msg << ": " << cudaGetErrorString(err) << std::endl;
@@ -184,60 +183,25 @@ __device__ int tournamentSelection(const double* fitnessValues, int populationSi
 }
 
 
-// __device__ void orderCrossover(const int* parent1, const int* parent2, int* child, int numCities, curandState* state) {
-
-//     int start = curand(state) % numCities;
-//     int end = curand(state) % numCities;
-//     bool flag[1024];
-
-//     if (start > end) swap(start, end);
-//     if (end - start > numCities / 4) {
-//         end = start + numCities / 4;
-//     } 
-    
-//     for (int i = 0; i < numCities; ++i) {
-//         if(i >= start && i <= end){
-//             child[i] = parent1[i];
-//             flag[parent1[i]] = true;
-//         } else {
-//             flag[i] = false;    
-//         }
-//     } 
-
-//     int current = (end + 1) % numCities;
-//     for (int i = 0; i < numCities; ++i) {
-//         int idx = (end + 1 + i) % numCities;
-//         if (!flag[parent2[i]]) {
-//             child[current] = parent2[idx];
-//             flag[parent2[i]] = true;
-//             current = (current + 1) % numCities;
-//         }
-//     }
-// }
-
 __device__ void orderCrossover(const int* parent1, const int* parent2, int* child, int numCities, curandState* state) {
-    
     int size = numCities;
     int start = curand(state) % size;
     int end = curand(state) % size;
-    bool flag[1024];
 
     if (start > end) swap(start, end);
 
     for (int i = 0; i < size; ++i) {
         child[i] = -1;
-        flag[i] = 0;
     }
 
     for (int i = start; i <= end; ++i) {
         child[i] = parent1[i];
-        flag[parent1[i]] = 1;
     }
 
     int current = (end + 1) % size;
     for (int i = 0; i < size; ++i) {
         int idx = (end + 1 + i) % size;
-        if (!flag[parent2[idx]]) {
+        if (thrust::find(thrust::seq, child, child + size, parent2[idx]) == child + size) {
             child[current] = parent2[idx];
             current = (current + 1) % size;
         }
@@ -246,13 +210,10 @@ __device__ void orderCrossover(const int* parent1, const int* parent2, int* chil
 
 
 __device__ void mutate(int* individual, int numCities, curandState* state) {
-
-    int start = curand(state) % numCities;
-    int end = curand(state) % numCities;
+    int size = numCities;
+    int start = curand(state) % size;
+    int end = curand(state) % size;
     int a, b;
-    
-    if (start > end) swap(start, end);
-
     for(int i = 0; i <= (end - start) / 2; i++){
         a = start + i;
         b = end - i;
@@ -290,13 +251,6 @@ __global__ void geneticAlgorithmKernel(const City* cities, int* population, int*
 
         orderCrossover(parent1, parent2, child, numCities, state);
 
-        // if(idx == 1) {
-        //     for (int j = 0; j < numCities; j++){
-        //         printf("%d ", child[j]);
-        //     }
-        //     printf("\n");
-        // }
-
         if (curand(state) % 100 < 10) {
             mutate(child, numCities, state);
         }
@@ -304,7 +258,6 @@ __global__ void geneticAlgorithmKernel(const City* cities, int* population, int*
         next_fitnessValues[idx] = 1.0 / pathDistance(cities, distanceMatrix, child, numCities);
     }
 }
-
 
 __global__ void applyNextGen(const City* cities, int* population,  int* next_population, double* fitnessValues, double* next_fitnessValues, int numCities, int populationSize, curandState* states) {
     unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -467,7 +420,8 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
             if(thread_id == 0){
 
                 showProgress(gen, generations, startTime);
- 
+
+                //GPU 0
                 calculateFitness<<<numBlocks, blockSize>>>(d_cities1, d_distanceMatrix1, d_population1, d_fitnessValues1, numCities, populationSize);
                 cudaDeviceSynchronize();
 
@@ -585,6 +539,11 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
         #pragma omp barrier
     }
 
+    std::cout << "\nbestfitness 1: " << bestFitness1 << std::endl;
+    std::cout << "best path 1 : " << 1 / bestFitness1 << std::endl;
+    std::cout << "bestfitness 2: " << bestFitness2 << std::endl;
+    std::cout << "best path 2 : " << 1 / bestFitness2 << std::endl;
+
     if(bestFitness1 >= bestFitness2){
         printf("return from GPU 0\n\n");
         return bestpath1;
@@ -594,36 +553,30 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
     } 
 }
 
-int main(int argc, char* argv[]) {
+int main() {
 
     // std::vector<City> cities = {
-    //     {60, 200}, {180, 200}, {80, 180}, {140, 180}, {20, 160},
-    //     {100, 160}, {200, 160}, {140, 140}, {40, 120}, {100, 120},
-    //     {180, 100}, {60, 80}, {120, 80}, {180, 60}, {20, 40},
-    //     {100, 40}, {200, 40}, {20, 20}, {60, 20}, {160, 20}
+    //     {60, 200}, {180, 200}, {80, 180}, {140, 180}, {20, 160} 
+    //     // {100, 160}, {200, 160}, {140, 140}, {40, 120}, {100, 120},
+    //     // {180, 100}, {60, 80}, {120, 80}, {180, 60}, {20, 40},
+    //     // {100, 40}, {200, 40}, {20, 20}, {60, 20}, {160, 20}
     // };
 
     // std::string filename = "assets/qa194.tsp";
-    std::string filename = "assets/uy734.tsp";
-    // std::string filename = "assets/mg1000.tsp";
-    int ratio = std::stoi(argv[1]);
-    int generations = std::stoi(argv[2]);
-
-    double answer = 0;
-
-    if(filename == "assets/qa194.tsp") answer = 9352.0;
-    if(filename == "assets/uy734.tsp") answer = 79114.0;
-    if(filename == "assets/mg1000.tsp") answer = 33000.0;
+    // double answer = 9771.0;
+    // std::string filename = "assets/uy734.tsp";
+    // double answer = 86396.0;
+    std::string filename = "assets/mg1000.tsp";
+    double answer = 38185.0;
 
     std::vector<City> cities = readTSPFile(filename);
     std::cout << "\n====================================" << std::endl;
     std::cout << "map file        : " << filename << std::endl;
 
     auto start_time = std::chrono::steady_clock::now();
-    int populationSize = cities.size() * ratio;
+    int populationSize = cities.size() * 20;
+    int generations = 4000;
 
-    std::cout << "num of cities   : " << cities.size() << std::endl;
-    std::cout << "ratio           : " << ratio << std::endl;
     std::cout << "population size : " << populationSize << std::endl;
     std::cout << "generations     : " << generations << std::endl;
 
@@ -631,36 +584,30 @@ int main(int argc, char* argv[]) {
 
     auto end_time = std::chrono::steady_clock::now();
 
-    size_t lastSlashPos = filename.find_last_of('/');
-    size_t lastDotPos = filename.find_last_of('.');
-
-    std::string fileIdentifier = filename.substr(lastSlashPos + 1, lastDotPos - lastSlashPos - 1);
-
-    std::ostringstream oss;
-    oss << "output_out/tsp_" << fileIdentifier << "_" << ratio << "_" << generations << ".out";
-    std::string outputFilename = oss.str();
-
-    std::ofstream outFile(outputFilename);
-    if (!outFile) {
-        std::cerr << "Unable to open output file." << std::endl;
-        return 1;
-    }
-
     auto start = find(bestPath.begin(), bestPath.end(), 0);
     if (start != bestPath.end()) {
         size_t index = std::distance(bestPath.begin(), start);
+        std::cout << "Best path: ";
         for (int i = 0; i < bestPath.size(); i++) {
-            outFile << bestPath[(index + i) % bestPath.size()] << " ";
+            std::cout << bestPath[(index + i) % bestPath.size()] << " ";
         }
     }
-    outFile << "0" << std::endl;
-    outFile.close();
+    std::cout << "0" << std::endl;
 
     double totalDistance = host_pathDistance(cities, bestPath);
 
     std::cout << "Total distance: " << totalDistance << std::endl;
     std::cout << "error: " << answer / totalDistance * 100 << "%" << std::endl;
     std::cout<<"Running Times: "<< std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count() << " s\n";
-
     return 0;
 }
+
+/*
+
+approximate best path from SOM-TSP:
+    qa194   : 9700
+    uy734   : 86000
+    fi10639 : 638131
+    it16862 : 
+
+*/
