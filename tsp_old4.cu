@@ -18,7 +18,6 @@ struct City {
     double x, y;
 };
 
-// tools
 
 void checkCudaError(cudaError_t err, const char *msg) {
     if (err != cudaSuccess) {
@@ -57,6 +56,7 @@ std::vector<City> readTSPFile(const std::string& filename) {
     return cities;
 }
 
+
 void showProgress(int current, int total, std::chrono::steady_clock::time_point startTime) {
     int width = 10;
     float progress = static_cast<float>(current) / total;
@@ -77,8 +77,6 @@ void showProgress(int current, int total, std::chrono::steady_clock::time_point 
     fflush(stdout);
 }
 
-// host functions
-
 double host_distance(const City& a, const City& b) {
     return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
 }
@@ -95,6 +93,41 @@ double host_pathDistance(const std::vector<City>& cities, const std::vector<int>
 double host_fitness(const std::vector<City>& cities, const std::vector<int>& path) {
     return 1.0 / host_pathDistance(cities, path);
 }
+
+__global__ void calculateDistances(const City* cities, double* distanceMatrix, int numCities) {
+    
+    unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    unsigned int stride = blockDim.x * gridDim.x;
+
+    for (unsigned int i = idx; i < numCities * numCities; i += stride) {
+        int x = i / numCities;
+        int y = i % numCities;
+        double dx = cities[x].x - cities[y].x;
+        double dy = cities[x].y - cities[y].y;
+        distanceMatrix[i] = std::sqrt(dx * dx + dy * dy);
+        // printf("(%d,%d) = %f\n", x, y, distanceMatrix[i]);
+    }
+}
+
+__device__ double pathDistance(const City* cities, const double* distanceMatrix, const int* path, int numCities) {
+    
+    double totalDistance = 0.0;
+    for (int i = 0; i < numCities - 1; ++i) {
+        totalDistance += distanceMatrix[path[i] * numCities + path[i + 1]];
+    }
+    totalDistance += distanceMatrix[path[0] * numCities + path[numCities - 1]];
+    return totalDistance;
+}
+
+__global__ void calculateFitness(const City* cities, double* distanceMatrix, const int* population, double* fitnessValues, int numCities, int populationSize) {
+    unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    unsigned int stride = blockDim.x * gridDim.x;
+
+    for (unsigned int i = idx; i < populationSize; i += stride) {
+        fitnessValues[idx] = 1.0 / pathDistance(cities, distanceMatrix, &population[idx * numCities], numCities);
+    }
+}
+
 
 std::vector<std::vector<int>> initializePopulation(int populationSize, int numCities) {
     std::vector<std::vector<int>> population(populationSize, std::vector<int>(numCities));
@@ -127,63 +160,12 @@ std::vector<std::vector<int>> unflattenPopulation(const int* flatPopulation, int
     return population;
 }
 
-// device functions
-
-// calculate distance and fitness
-
-__device__ double pathDistance(const City* cities, const double* distanceMatrix, const int* path, int numCities) {
-    
-    double totalDistance = 0.0;
-    for (int i = 0; i < numCities - 1; ++i) {
-        totalDistance += distanceMatrix[path[i] * numCities + path[i + 1]];
-    }
-    totalDistance += distanceMatrix[path[0] * numCities + path[numCities - 1]];
-    return totalDistance;
-}
-
-__global__ void calculateFitness(const City* cities, double* distanceMatrix, const int* population, double* fitnessValues, int numCities, int populationSize) {
-    unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    unsigned int stride = blockDim.x * gridDim.x;
-
-    for (unsigned int i = idx; i < populationSize; i += stride) {
-        fitnessValues[idx] = 1.0 / pathDistance(cities, distanceMatrix, &population[idx * numCities], numCities);
-    }
-}
-
 __device__ void swap(int& a, int& b) {
     int temp = a;
     a = b;
     b = temp;
 }
 
-__global__ void calculateDistances(const City* cities, double* distanceMatrix, int numCities) {
-    
-    unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    unsigned int stride = blockDim.x * gridDim.x;
-
-    for (unsigned int i = idx; i < numCities * numCities; i += stride) {
-        int x = i / numCities;
-        int y = i % numCities;
-        double dx = cities[x].x - cities[y].x;
-        double dy = cities[x].y - cities[y].y;
-        distanceMatrix[i] = std::sqrt(dx * dx + dy * dy);
-    }
-}
-
-// Genetic Algorithm Kernel
-
-// setup curand state
-
-__global__ void setupCurandStates(curandState* states, unsigned long seed, int populationSize) {
-    unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    unsigned int stride = blockDim.x * gridDim.x;
-    for (unsigned int i = idx; i < populationSize; i += stride) {
-        curand_init(seed, idx, 0, &states[idx]);
-    }
-}
-
-
-// tournament selection
 
 __device__ int tournamentSelection(const double* fitnessValues, int populationSize, unsigned int childId, int islandSize, curandState* state) {
     int tournamentSize = 5;
@@ -193,7 +175,6 @@ __device__ int tournamentSelection(const double* fitnessValues, int populationSi
 
     for (int i = 0; i < tournamentSize; ++i) {
         int idx = childBlock * islandSize + curand(state) % islandSize ;
-        if (curand(state) % 100 < 5) idx = (idx + islandSize) % populationSize;
         if (fitnessValues[idx] > bestFitness) {
             bestFitness = fitnessValues[idx];
             best = idx;
@@ -202,7 +183,37 @@ __device__ int tournamentSelection(const double* fitnessValues, int populationSi
     return best;
 }
 
-// crossover
+
+// __device__ void orderCrossover(const int* parent1, const int* parent2, int* child, int numCities, curandState* state) {
+
+//     int start = curand(state) % numCities;
+//     int end = curand(state) % numCities;
+//     bool flag[1024];
+
+//     if (start > end) swap(start, end);
+//     if (end - start > numCities / 4) {
+//         end = start + numCities / 4;
+//     } 
+    
+//     for (int i = 0; i < numCities; ++i) {
+//         if(i >= start && i <= end){
+//             child[i] = parent1[i];
+//             flag[parent1[i]] = true;
+//         } else {
+//             flag[i] = false;    
+//         }
+//     } 
+
+//     int current = (end + 1) % numCities;
+//     for (int i = 0; i < numCities; ++i) {
+//         int idx = (end + 1 + i) % numCities;
+//         if (!flag[parent2[i]]) {
+//             child[current] = parent2[idx];
+//             flag[parent2[i]] = true;
+//             current = (current + 1) % numCities;
+//         }
+//     }
+// }
 
 __device__ void orderCrossover(const int* parent1, const int* parent2, int* child, int numCities, curandState* state) {
     
@@ -233,7 +244,6 @@ __device__ void orderCrossover(const int* parent1, const int* parent2, int* chil
     }
 }
 
-// mutate
 
 __device__ void mutate(int* individual, int numCities, curandState* state) {
 
@@ -251,6 +261,16 @@ __device__ void mutate(int* individual, int numCities, curandState* state) {
         }
     } 
 }
+
+
+__global__ void setupCurandStates(curandState* states, unsigned long seed, int populationSize) {
+    unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    unsigned int stride = blockDim.x * gridDim.x;
+    for (unsigned int i = idx; i < populationSize; i += stride) {
+        curand_init(seed, idx, 0, &states[idx]);
+    }
+}
+
 
 __global__ void geneticAlgorithmKernel(const City* cities, int* population, int* next_population, double* distanceMatrix, double* fitnessValues, double* next_fitnessValues, int numCities, int populationSize, int islandSize, curandState* states) {
     unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -270,6 +290,13 @@ __global__ void geneticAlgorithmKernel(const City* cities, int* population, int*
 
         orderCrossover(parent1, parent2, child, numCities, state);
 
+        // if(idx == 1) {
+        //     for (int j = 0; j < numCities; j++){
+        //         printf("%d ", child[j]);
+        //     }
+        //     printf("\n");
+        // }
+
         if (curand(state) % 100 < 10) {
             mutate(child, numCities, state);
         }
@@ -278,7 +305,6 @@ __global__ void geneticAlgorithmKernel(const City* cities, int* population, int*
     }
 }
 
-// apply next generation to population
 
 __global__ void applyNextGen(const City* cities, int* population,  int* next_population, double* fitnessValues, double* next_fitnessValues, int numCities, int populationSize, curandState* states) {
     unsigned int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -296,9 +322,8 @@ __global__ void applyNextGen(const City* cities, int* population,  int* next_pop
     }
 }
 
-// main Genetic Algorithm
 
-std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populationSize, int generations, int numIslands, int migration_rate) {
+std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populationSize, int generations) {
     
     int numCities = cities.size();
 
@@ -330,14 +355,14 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
 
     std::vector<int> bestpath1;
     std::vector<int> bestpath2;
-    
+
+    int numIslands = 2;
     int islandSize = populationSize / numIslands;
     
     #pragma omp parallel num_threads(2)
     {
         int thread_id = omp_get_thread_num();
 
-        // set up memories in GPU
         if(thread_id == 0){
 
             // GPU 0
@@ -361,17 +386,17 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
             cudaMemcpy(d_population1, flatPopulation1.data(), populationSize * numCities * sizeof(int), cudaMemcpyHostToDevice);
 
             cudaGetDevice(&deviceId);
-            // if(deviceId == 0) printf("GPU 0 working!!!\n");
+            if(deviceId == 0) printf("GPU 0 working!!!\n");
             cudaDeviceGetAttribute(&numberOfSMs, cudaDevAttrMultiProcessorCount, deviceId);
 
             blockSize = 512;
             numBlocks = 32 * numberOfSMs;
             numThreads = blockSize * numBlocks;
 
-            // std::cout << "block size      : " << blockSize << std::endl;
-            // std::cout << "num of blocks   : " << numBlocks << std::endl;
-            // std::cout << "total threads   : " << numThreads << std::endl;
-            // std::cout << "====================================\n" << std::endl;
+            std::cout << "block size      : " << blockSize << std::endl;
+            std::cout << "num of blocks   : " << numBlocks << std::endl;
+            std::cout << "total threads   : " << numThreads << std::endl;
+            std::cout << "====================================\n" << std::endl;
 
             //set random state for GPU 0 
             setupCurandStates<<<numBlocks, blockSize>>>(d_states1, time(0), populationSize);
@@ -403,7 +428,7 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
             cudaMemcpy(d_population2, flatPopulation1.data(), populationSize * numCities * sizeof(int), cudaMemcpyHostToDevice);
 
             cudaGetDevice(&deviceId);
-            // if(deviceId == 1) printf("GPU 1 working!!!\n");
+            if(deviceId == 1) printf("GPU 1 working!!!\n");
             cudaDeviceGetAttribute(&numberOfSMs, cudaDevAttrMultiProcessorCount, deviceId);
 
             blockSize = 512;
@@ -466,14 +491,13 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
             }
 
             // merge population1 and population 2 per 5000 generations
-            if(gen % migration_rate == 0 && gen != 0){
+            if(gen % 1000 == 0 && gen != 0){
 
                 #pragma omp barrier
 
                 //pass self population to other side next_population
                 if (thread_id == 0) {
-                    printf("Migration between GPUs at gen: %d    \n", gen);
-                    // printf("copy from GPU 0 to GPU 1 at gen: %d\n", gen);
+                    printf("copy from GPU 0 to GPU 1 at gen: %d\n", gen);
                     if (canAccessPeer0) {
                         checkCudaError(cudaMemcpyPeer(d_next_population2, 1, d_population1, 0, populationSize * numCities * sizeof(int)), "Peer-to-peer memory copy from GPU 0 to GPU 1 failed");
                         checkCudaError(cudaMemcpyPeer(d_next_fitnessValues2, 1, d_fitnessValues1, 0, populationSize * sizeof(double)), "Peer-to-peer memory copy from GPU 0 to GPU 1 failed");
@@ -484,7 +508,7 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
 
                 } else {
 
-                    // printf("copy from GPU 1 to GPU 0 at gen: %d\n", gen);
+                    printf("copy from GPU 1 to GPU 0 at gen: %d\n", gen);
                     if (canAccessPeer1) {
                         checkCudaError(cudaMemcpyPeer(d_next_population1, 0, d_population2, 1, populationSize * numCities * sizeof(int)), "Peer-to-peer memory copy from GPU 1 to GPU 0 failed");
                         checkCudaError(cudaMemcpyPeer(d_next_fitnessValues1, 0, d_fitnessValues2, 1, populationSize * sizeof(double)), "Peer-to-peer memory copy from GPU 1 to GPU 0 failed");
@@ -500,6 +524,7 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
                 if(thread_id == 0){
                     applyNextGen<<<numBlocks, blockSize>>>(d_cities1, d_population1, d_next_population1, d_fitnessValues1, d_next_fitnessValues1, numCities, populationSize, d_states1);
                     cudaDeviceSynchronize();
+
                 } else {
                     applyNextGen<<<numBlocks, blockSize>>>(d_cities2, d_population2, d_next_population2, d_fitnessValues2, d_next_fitnessValues2, numCities, populationSize, d_states2);
                     cudaDeviceSynchronize();
@@ -561,46 +586,15 @@ std::vector<int> geneticAlgorithm(const std::vector<City>& cities, int populatio
     }
 
     if(bestFitness1 >= bestFitness2){
-        printf("return from GPU 0   \n\n");
+        printf("return from GPU 0\n\n");
         return bestpath1;
     }else{
-        printf("return from GPU 1   \n\n");
+        printf("return from GPU 1\n\n");
         return bestpath2;
     } 
 }
 
-void saveBestPath(const std::string &filename, const std::vector<int> &bestPath, double ratio, int generations) {
-
-    size_t lastSlashPos = filename.find_last_of('/');
-    size_t lastDotPos = filename.find_last_of('.');
-    std::string fileIdentifier = filename.substr(lastSlashPos + 1, lastDotPos - lastSlashPos - 1);
-
-    std::ostringstream oss;
-    oss << "output_out/tsp_" << fileIdentifier << "_" << ratio << "_" << generations << ".out";
-    std::string outputFilename = oss.str();
-
-    std::ofstream outFile(outputFilename);
-    if (!outFile) {
-        std::cerr << "Unable to open output file." << std::endl;
-        return;
-    }
-
-    auto start = std::find(bestPath.begin(), bestPath.end(), 0);
-    if (start != bestPath.end()) {
-        size_t index = std::distance(bestPath.begin(), start);
-        for (size_t i = 0; i < bestPath.size(); i++) {
-            outFile << bestPath[(index + i) % bestPath.size()] << " ";
-        }
-    }
-    outFile << "0" << std::endl;
-    outFile.close();
-
-    return;
-}
-
 int main(int argc, char* argv[]) {
-
-    auto start_time = std::chrono::steady_clock::now();
 
     // std::vector<City> cities = {
     //     {60, 200}, {180, 200}, {80, 180}, {140, 180}, {20, 160},
@@ -610,47 +604,59 @@ int main(int argc, char* argv[]) {
     // };
 
     // std::string filename = "assets/qa194.tsp";
-    // std::string filename = "assets/uy734.tsp";
+    std::string filename = "assets/uy734.tsp";
     // std::string filename = "assets/mg1000.tsp";
+    int ratio = std::stoi(argv[1]);
+    int generations = std::stoi(argv[2]);
 
-    if (argc != 6) {
-        std::cerr << "Usage: " << argv[0] << " <filename> <ratio> <generations> <numIslands> <migration_rate>" << std::endl;
-        return 1;
-    }
+    double answer = 0;
 
-    // command: ./tsp assets/qa194.tsp 40 4000 2 1000
-
-    std::string filename = argv[1];
-    int ratio = std::stoi(argv[2]);
-    int generations = std::stoi(argv[3]);
-    int numIslands = std::stoi(argv[4]);
-    int migration_rate = std::stoi(argv[5]);
+    if(filename == "assets/qa194.tsp") answer = 9352.0;
+    if(filename == "assets/uy734.tsp") answer = 79114.0;
+    if(filename == "assets/mg1000.tsp") answer = 33000.0;
 
     std::vector<City> cities = readTSPFile(filename);
-    int populationSize = cities.size() * ratio;
-
     std::cout << "\n====================================" << std::endl;
     std::cout << "map file        : " << filename << std::endl;
+
+    auto start_time = std::chrono::steady_clock::now();
+    int populationSize = cities.size() * ratio;
+
     std::cout << "num of cities   : " << cities.size() << std::endl;
     std::cout << "ratio           : " << ratio << std::endl;
     std::cout << "population size : " << populationSize << std::endl;
     std::cout << "generations     : " << generations << std::endl;
-    std::cout << "num of islands  : " << numIslands << std::endl;
-    std::cout << "migration rate  : " << migration_rate << std::endl;
-    std::cout << "====================================\n" << std::endl;
 
-    std::vector<int> bestPath = geneticAlgorithm(cities, populationSize, generations, numIslands, migration_rate);
+    std::vector<int> bestPath = geneticAlgorithm(cities, populationSize, generations);
 
-    saveBestPath(filename, bestPath, ratio, generations);
-
-    double totalDistance = host_pathDistance(cities, bestPath);
     auto end_time = std::chrono::steady_clock::now();
 
-    double answer = 0;
-    if(filename == "assets/qa194.tsp") answer = 9352.0;
-    if(filename == "assets/uy734.tsp") answer = 79114.0;
-    if(filename == "assets/mg1000.tsp") answer = 33000.0;
-    if(filename == "assets/dsj1000.tsp") answer = 18660188.0;
+    size_t lastSlashPos = filename.find_last_of('/');
+    size_t lastDotPos = filename.find_last_of('.');
+
+    std::string fileIdentifier = filename.substr(lastSlashPos + 1, lastDotPos - lastSlashPos - 1);
+
+    std::ostringstream oss;
+    oss << "output_out/tsp_" << fileIdentifier << "_" << ratio << "_" << generations << ".out";
+    std::string outputFilename = oss.str();
+
+    std::ofstream outFile(outputFilename);
+    if (!outFile) {
+        std::cerr << "Unable to open output file." << std::endl;
+        return 1;
+    }
+
+    auto start = find(bestPath.begin(), bestPath.end(), 0);
+    if (start != bestPath.end()) {
+        size_t index = std::distance(bestPath.begin(), start);
+        for (int i = 0; i < bestPath.size(); i++) {
+            outFile << bestPath[(index + i) % bestPath.size()] << " ";
+        }
+    }
+    outFile << "0" << std::endl;
+    outFile.close();
+
+    double totalDistance = host_pathDistance(cities, bestPath);
 
     std::cout << "Total distance: " << totalDistance << std::endl;
     std::cout << "error: " << answer / totalDistance * 100 << "%" << std::endl;
